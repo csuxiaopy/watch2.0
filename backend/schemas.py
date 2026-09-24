@@ -106,6 +106,10 @@ class DownloadDelete(BaseModel):
     delete_files: bool = False
 
 
+class FileRename(BaseModel):
+    new_name: str = Field(min_length=1, max_length=255)
+
+
 class Slot(BaseModel):
     slot_id: int = Field(ge=0, le=12)
     position: str

@@ -99,6 +99,7 @@ async function toggleWallFullscreen() {
 
 async function refreshMedia() { media.value = await api.media() }
 async function refreshWatchlist() { watchlist.value = await api.watchlist() }
+async function refreshLayout() { layout.value = await api.layout() }
 async function removeWanted(item: MediaItem) {
   try { await api.removeFromWatchlist(item.id); await refreshWatchlist(); notify('已从想看列表移出') }
   catch (error) { notify(error) }
@@ -165,7 +166,7 @@ onBeforeUnmount(() => document.removeEventListener('fullscreenchange', syncFulls
       />
     </section>
     <div v-if="!started && !managerOpen" class="start-overlay"><button @click="playAll"><span>▶</span><strong>开始播放</strong><small>点击后启动全部已配置的视频</small></button></div>
-    <LibraryManager v-if="managerOpen" :watchlist-ids="watchlist.map(item => item.id)" @close="managerOpen=false" @changed="refreshMedia" @watchlist-changed="refreshWatchlist" />
+    <LibraryManager v-if="managerOpen" :watchlist-ids="watchlist.map(item => item.id)" @close="managerOpen=false" @changed="refreshMedia" @watchlist-changed="refreshWatchlist" @layout-changed="refreshLayout" />
     <div v-if="message" class="toast">{{ message }}</div>
   </main>
 </template>

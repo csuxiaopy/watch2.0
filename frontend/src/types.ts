@@ -50,3 +50,9 @@ export interface DownloadTask {
   progress: number; size: number; dlspeed: number; upspeed: number; eta: number; state: string
   imported_media: { media_id: string; name: string }[]
 }
+export interface MediaImportResult { original_name: string; saved_name: string; relative_path: string; size: number }
+export interface FileActions {
+  local: boolean; can_rename: boolean; delete_mode: 'single_file' | 'torrent' | 'record_only' | null
+  affected_media: number; reason?: string | null
+}
+export interface FileDeleteResult { deleted_media_ids: string[]; deleted_files: string[]; torrent_hash?: string | null }

@@ -4,6 +4,7 @@ import os
 import subprocess
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +14,16 @@ MEDIA_EXTENSIONS = {".mp4", ".webm", ".ogg", ".ogv", ".mov", ".m4v", ".mkv", ".a
 THUMBNAIL_ROOT = Path(os.getenv("THUMBNAIL_ROOT", "/data/thumbnails")).resolve()
 FINGERPRINT_CHUNK = 1024 * 1024
 _scan_lock = threading.Lock()
+
+
+@contextmanager
+def media_operation():
+    if not _scan_lock.acquire(blocking=False):
+        raise RuntimeError("媒体库正在扫描，请稍后重试")
+    try:
+        yield
+    finally:
+        _scan_lock.release()
 
 
 def utcnow() -> str:

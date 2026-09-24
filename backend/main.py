@@ -1,23 +1,28 @@
 import json
 import math
 import mimetypes
+import os
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .database import connect, init_database
-from .media_service import THUMBNAIL_ROOT, safe_media_path, start_scan, sync_libraries, utcnow
+from .media_service import (MEDIA_EXTENSIONS, THUMBNAIL_ROOT, media_operation,
+                            safe_media_path, start_scan, sync_libraries, utcnow)
 from .download_service import start_monitor, stop_monitor
 from .qbittorrent import QBitClient, QBitError, normalize_hash
 from .schemas import (CollectionItems, Layout, MediaItem, MediaPage, MediaUpdate,
                       NameCreate, ProgressUpdate, SourceCreate, TagBatch, WatchlistOrder,
-                      MagnetCreate, DownloadDelete)
+                      MagnetCreate, DownloadDelete, FileRename)
 
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+_import_lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -56,6 +61,47 @@ def require_media(item_id: str, db):
     if row is None:
         raise HTTPException(404, "视频不存在")
     return row
+
+
+def _local_media_row(item_id: str, db):
+    row = db.execute("""SELECT m.*,l.root_path FROM media m LEFT JOIN libraries l ON l.id=m.library_id
+        WHERE m.id=?""", (item_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "视频不存在")
+    if row["kind"] != "local" or not row["root_path"]:
+        raise HTTPException(400, "该视频不是本地文件")
+    return row
+
+
+def _validate_file_name(name: str, current_name: str) -> str:
+    value = name.strip()
+    if (not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value
+            or any(ord(char) < 32 for char in value)):
+        raise HTTPException(422, "文件名不合法")
+    if Path(value).suffix.lower() != Path(current_name).suffix.lower():
+        raise HTTPException(422, "不能修改视频扩展名")
+    return value
+
+
+def _clear_layout_media(db, media_ids: list[str]) -> None:
+    layout = json.loads(db.execute("SELECT value FROM settings WHERE key='layout'").fetchone()[0])
+    changed = False
+    for slot in layout["slots"]:
+        if slot["media_id"] in media_ids:
+            slot.update(media_id=None, playing=False)
+            changed = True
+    if changed:
+        db.execute("UPDATE settings SET value=? WHERE key='layout'", (json.dumps(layout),))
+
+
+def _remove_thumbnails(names: list[str | None]) -> None:
+    for name in names:
+        if not name:
+            continue
+        try:
+            safe_media_path(THUMBNAIL_ROOT, name).unlink(missing_ok=True)
+        except (OSError, PermissionError):
+            pass
 
 
 @app.get("/api/health")
@@ -167,6 +213,118 @@ def get_media_detail(item_id: str):
         return serialize_media(require_media(item_id, db), db)
 
 
+@app.get("/api/library/media/{item_id}/file-actions")
+def get_file_actions(item_id: str):
+    with connect() as db:
+        row = require_media(item_id, db)
+        if row["kind"] != "local":
+            return {"local": False, "can_rename": False, "delete_mode": None,
+                    "affected_media": 0, "reason": "网络视频不包含本地文件"}
+        if row["library_id"] == "downloads":
+            linked = db.execute("SELECT torrent_hash FROM download_imports WHERE media_id=?", (item_id,)).fetchall()
+            hashes = {item[0] for item in linked}
+            if len(hashes) != 1:
+                return {"local": True, "can_rename": False, "delete_mode": None,
+                        "affected_media": 0, "reason": "无法确定对应的下载任务，请在磁力下载页面处理"}
+            info_hash = next(iter(hashes))
+            count = db.execute("SELECT count(DISTINCT media_id) FROM download_imports WHERE torrent_hash=? AND media_id IS NOT NULL",
+                               (info_hash,)).fetchone()[0]
+            return {"local": True, "can_rename": False, "delete_mode": "torrent",
+                    "affected_media": count, "reason": "该文件由 qBittorrent 管理，不能单独改名"}
+        root = Path(db.execute("SELECT root_path FROM libraries WHERE id=?", (row["library_id"],)).fetchone()[0])
+        try:
+            path = safe_media_path(root, row["location"])
+            exists = path.is_file()
+            writable = exists and os.access(path.parent, os.W_OK)
+        except PermissionError:
+            exists = writable = False
+        return {"local": True, "can_rename": bool(writable),
+                "delete_mode": "single_file" if exists else "record_only", "affected_media": 1,
+                "reason": None if writable else ("文件不存在，只能清理媒体记录" if not exists else "媒体目录不可写")}
+
+
+@app.put("/api/library/media/{item_id}/file-name", response_model=MediaItem)
+def rename_media_file(item_id: str, payload: FileRename):
+    try:
+        with media_operation():
+            with connect() as db:
+                row = _local_media_row(item_id, db)
+                if row["library_id"] == "downloads":
+                    raise HTTPException(409, "下载视频由 qBittorrent 管理，不能单独改名")
+                root = Path(row["root_path"])
+                source = safe_media_path(root, row["location"])
+                if not source.is_file():
+                    raise HTTPException(404, "本地视频文件不存在")
+                new_name = _validate_file_name(payload.new_name, source.name)
+                new_relative = (Path(row["location"]).parent / new_name).as_posix()
+                destination = safe_media_path(root, new_relative)
+                if destination == source:
+                    return serialize_media(row, db)
+                if destination.exists():
+                    raise HTTPException(409, "同目录下已存在同名文件")
+                try:
+                    os.replace(source, destination)
+                    db.execute("""UPDATE media SET location=?,original_name=?,
+                        name=CASE WHEN custom_title=1 THEN name ELSE ? END,last_scanned_at=? WHERE id=?""",
+                               (new_relative, new_name, new_name, utcnow(), item_id))
+                    db.commit()
+                except Exception:
+                    if destination.exists() and not source.exists():
+                        os.replace(destination, source)
+                    raise
+                return serialize_media(require_media(item_id, db), db)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.delete("/api/library/media/{item_id}/file")
+def delete_media_file(item_id: str):
+    try:
+        with media_operation():
+            with connect() as db:
+                row = _local_media_row(item_id, db)
+                if row["library_id"] == "downloads":
+                    hashes = {item[0] for item in db.execute(
+                        "SELECT torrent_hash FROM download_imports WHERE media_id=?", (item_id,)).fetchall()}
+                    if len(hashes) != 1:
+                        raise HTTPException(409, "无法确定对应的下载任务，请在磁力下载页面处理")
+                    info_hash = next(iter(hashes))
+                    affected = db.execute("""SELECT DISTINCT m.id,m.location,m.thumbnail_path FROM download_imports di
+                        JOIN media m ON m.id=di.media_id WHERE di.torrent_hash=?""", (info_hash,)).fetchall()
+                    _qbt_call(lambda client: client.action(info_hash, "delete", True))
+                    ids = [item["id"] for item in affected]
+                    _clear_layout_media(db, ids)
+                    for media_id in ids:
+                        db.execute("DELETE FROM media WHERE id=?", (media_id,))
+                    db.commit()
+                    _remove_thumbnails([item["thumbnail_path"] for item in affected])
+                    return {"deleted_media_ids": ids, "deleted_files": [item["location"] for item in affected],
+                            "torrent_hash": info_hash}
+
+                root = Path(row["root_path"])
+                source = safe_media_path(root, row["location"])
+                tombstone = source.with_name(f".{uuid.uuid4().hex}.delete")
+                moved = False
+                try:
+                    if source.is_file():
+                        os.replace(source, tombstone)
+                        moved = True
+                    _clear_layout_media(db, [item_id])
+                    db.execute("DELETE FROM media WHERE id=?", (item_id,))
+                    db.commit()
+                except Exception:
+                    if moved and tombstone.exists() and not source.exists():
+                        os.replace(tombstone, source)
+                    raise
+                if moved:
+                    tombstone.unlink(missing_ok=True)
+                _remove_thumbnails([row["thumbnail_path"]])
+                return {"deleted_media_ids": [item_id], "deleted_files": [row["location"]] if moved else [],
+                        "torrent_hash": None}
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.patch("/api/library/media/{item_id}", response_model=MediaItem)
 def update_media(item_id: str, payload: MediaUpdate):
     values = payload.model_dump(exclude_unset=True)
@@ -194,6 +352,55 @@ def save_progress(item_id: str, payload: ProgressUpdate):
 @app.post("/api/media/scan", status_code=202)
 def rescan_media():
     return {"job_id": start_scan()}
+
+
+def _validated_upload_name(filename: str | None) -> str:
+    name = (filename or "").strip()
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+        raise HTTPException(422, "文件名不合法")
+    if Path(name).suffix.lower() not in MEDIA_EXTENSIONS:
+        raise HTTPException(415, "不支持的视频格式")
+    return name
+
+
+def _available_name(root: Path, name: str) -> str:
+    candidate = name
+    stem, suffix = Path(name).stem, Path(name).suffix
+    number = 2
+    while (root / candidate).exists():
+        candidate = f"{stem} ({number}){suffix}"
+        number += 1
+    return candidate
+
+
+@app.post("/api/media/import", status_code=201)
+def import_media(file: UploadFile = File(...)):
+    original_name = _validated_upload_name(file.filename)
+    root = Path(os.getenv("MEDIA_ROOT", "media")).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = root / f".{uuid.uuid4().hex}.part"
+    size = 0
+    try:
+        with temporary.open("xb") as target:
+            while chunk := file.file.read(UPLOAD_CHUNK_SIZE):
+                target.write(chunk)
+                size += len(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        with _import_lock:
+            saved_name = _available_name(root, original_name)
+            destination = safe_media_path(root, saved_name)
+            os.replace(temporary, destination)
+        return {"original_name": original_name, "saved_name": saved_name,
+                "relative_path": saved_name, "size": size}
+    except HTTPException:
+        raise
+    except OSError as exc:
+        status = 507 if getattr(exc, "errno", None) == 28 else 500
+        raise HTTPException(status, "磁盘空间不足" if status == 507 else "视频复制失败") from exc
+    finally:
+        file.file.close()
+        temporary.unlink(missing_ok=True)
 
 
 @app.get("/api/media/scan/{job_id}")

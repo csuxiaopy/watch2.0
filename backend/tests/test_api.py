@@ -40,6 +40,93 @@ def test_scan_metadata_layout_and_range(tmp_path, monkeypatch):
         assert len(client.get("/api/layout").json()["slots"]) == 13
 
 
+def test_media_import_streams_renames_and_rejects_unsafe_names(tmp_path, monkeypatch):
+    client, media, _, _ = make_client(tmp_path, monkeypatch)
+    (media / "lesson.mp4").write_bytes(b"original")
+    with client:
+        first = client.post("/api/media/import", files={"file": ("lesson.mp4", b"new-video", "video/mp4")})
+        assert first.status_code == 201
+        assert first.json()["saved_name"] == "lesson (2).mp4"
+        assert (media / "lesson.mp4").read_bytes() == b"original"
+        assert (media / "lesson (2).mp4").read_bytes() == b"new-video"
+        assert client.post("/api/media/import", files={"file": ("notes.txt", b"no", "text/plain")}).status_code == 415
+        unsafe = client.post("/api/media/import", files={"file": ("../evil.mp4", b"no", "video/mp4")})
+        assert unsafe.status_code == 422
+        assert not list(media.glob("*.part"))
+
+
+def test_real_file_rename_preserves_identity_and_delete_cleans_relations(tmp_path, monkeypatch):
+    client, media, database, service = make_client(tmp_path, monkeypatch)
+    (media / "lesson.mp4").write_bytes(b"video")
+    with client:
+        scan(client)
+        item = client.get("/api/media").json()[0]; item_id = item["id"]
+        tag = client.post("/api/tags", json={"name": "保留"}).json()
+        client.post("/api/tags/batch", json={"media_ids": [item_id], "tag_ids": [tag["id"]], "action": "add"})
+        collection = client.post("/api/collections", json={"name": "课程"}).json()
+        client.put(f"/api/collections/{collection['id']}/items", json={"media_ids": [item_id]})
+        client.post(f"/api/watchlist/{item_id}")
+        client.put(f"/api/library/media/{item_id}/progress", json={"position": 42, "duration": 120})
+        layout = client.get("/api/layout").json(); layout["slots"][0]["media_id"] = item_id
+        client.put("/api/layout", json=layout)
+
+        renamed = client.put(f"/api/library/media/{item_id}/file-name", json={"new_name": "renamed.mp4"})
+        assert renamed.status_code == 200
+        body = renamed.json(); assert body["id"] == item_id and body["location"] == "renamed.mp4"
+        assert body["name"] == "renamed.mp4" and body["playback_position"] == 42
+        assert not (media / "lesson.mp4").exists() and (media / "renamed.mp4").read_bytes() == b"video"
+        assert client.get("/api/watchlist").json()[0]["id"] == item_id
+        assert client.get("/api/library/media", params={"tag_id": tag["id"]}).json()["total"] == 1
+        assert client.get("/api/library/media", params={"collection_id": collection["id"]}).json()["total"] == 1
+
+        (media / "taken.mp4").write_bytes(b"taken")
+        assert client.put(f"/api/library/media/{item_id}/file-name", json={"new_name": "taken.mp4"}).status_code == 409
+        assert client.put(f"/api/library/media/{item_id}/file-name", json={"new_name": "bad.mkv"}).status_code == 422
+        assert client.put(f"/api/library/media/{item_id}/file-name", json={"new_name": "../bad.mp4"}).status_code == 422
+
+        service._scan_lock.acquire()
+        try:
+            assert client.put(f"/api/library/media/{item_id}/file-name", json={"new_name": "blocked.mp4"}).status_code == 409
+        finally:
+            service._scan_lock.release()
+
+        deleted = client.delete(f"/api/library/media/{item_id}/file")
+        assert deleted.status_code == 200 and deleted.json()["deleted_media_ids"] == [item_id]
+        assert not (media / "renamed.mp4").exists()
+        assert client.get(f"/api/library/media/{item_id}").status_code == 404
+        assert client.get("/api/watchlist").json() == []
+        assert client.get("/api/layout").json()["slots"][0]["media_id"] is None
+
+
+def test_download_media_delete_removes_whole_torrent(tmp_path, monkeypatch):
+    client, _, database, _ = make_client(tmp_path, monkeypatch)
+    info_hash = "a" * 40
+    calls = []
+
+    class FakeClient:
+        def close(self): pass
+        def action(self, value, action, delete_files=False): calls.append((value, action, delete_files))
+
+    import backend.main as main
+    monkeypatch.setattr(main, "QBitClient", FakeClient)
+    with client:
+        with database.connect() as db:
+            db.execute("INSERT OR REPLACE INTO libraries(id,name,root_path) VALUES('downloads','下载','/media/downloads')")
+            for index in range(2):
+                media_id = f"download-{index}"
+                db.execute("INSERT INTO media(id,name,kind,location,available,library_id,original_name) VALUES(?,?, 'local',?,1,'downloads',?)",
+                           (media_id, f"video-{index}.mp4", f"video-{index}.mp4", f"video-{index}.mp4"))
+                db.execute("INSERT INTO download_imports(torrent_hash,relative_path,media_id,status) VALUES(?,?,?,'imported')",
+                           (info_hash, f"video-{index}.mp4", media_id))
+        actions = client.get("/api/library/media/download-0/file-actions").json()
+        assert actions["delete_mode"] == "torrent" and actions["affected_media"] == 2 and not actions["can_rename"]
+        assert client.put("/api/library/media/download-0/file-name", json={"new_name": "other.mp4"}).status_code == 409
+        deleted = client.delete("/api/library/media/download-0/file")
+        assert deleted.status_code == 200 and set(deleted.json()["deleted_media_ids"]) == {"download-0", "download-1"}
+        assert calls == [(info_hash, "delete", True)]
+        assert client.get("/api/library/media/download-1").status_code == 404
+
+
 def test_incremental_rename_missing_and_restore(tmp_path, monkeypatch):
     client, media, _, service = make_client(tmp_path, monkeypatch)
     source = media / "old.mp4"; source.write_bytes(b"same-video"); calls = 0

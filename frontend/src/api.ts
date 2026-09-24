@@ -1,4 +1,4 @@
-import type { Collection, DownloadStatus, DownloadTask, Layout, MediaItem, MediaKind, MediaPage, ScanJob, Tag } from './types'
+import type { Collection, DownloadStatus, DownloadTask, FileActions, FileDeleteResult, Layout, MediaImportResult, MediaItem, MediaKind, MediaPage, ScanJob, Tag } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -19,6 +19,9 @@ export const api = {
   libraryMedia: (params: URLSearchParams) => request<MediaPage>(`/api/library/media?${params}`),
   updateMedia: (id: string, value: Partial<Pick<MediaItem, 'name' | 'notes' | 'rating' | 'favorite' | 'completed' | 'playback_position'>>) =>
     request<MediaItem>(`/api/library/media/${id}`, { method: 'PATCH', body: JSON.stringify(value) }),
+  fileActions: (id: string) => request<FileActions>(`/api/library/media/${id}/file-actions`),
+  renameMediaFile: (id: string, new_name: string) => request<MediaItem>(`/api/library/media/${id}/file-name`, { method: 'PUT', body: JSON.stringify({ new_name }) }),
+  deleteMediaFile: (id: string) => request<FileDeleteResult>(`/api/library/media/${id}/file`, { method: 'DELETE' }),
   saveProgress: (id: string, position: number, duration?: number, completed?: boolean) =>
     request<{ ok: boolean }>(`/api/library/media/${id}/progress`, { method: 'PUT', body: JSON.stringify({ position, duration, completed }) }),
   tags: () => request<Tag[]>('/api/tags'),
@@ -49,4 +52,20 @@ export const api = {
   pauseDownload: (hash: string) => request<void>(`/api/downloads/${hash}/pause`, { method: 'POST' }),
   resumeDownload: (hash: string) => request<void>(`/api/downloads/${hash}/resume`, { method: 'POST' }),
   deleteDownload: (hash: string, delete_files = false) => request<void>(`/api/downloads/${hash}`, { method: 'DELETE', body: JSON.stringify({ delete_files }) }),
+  importMedia: (file: File, onProgress: (percent: number) => void) => new Promise<MediaImportResult>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/media/import')
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100))
+    }
+    xhr.onerror = () => reject(new Error('网络错误，视频上传失败'))
+    xhr.onload = () => {
+      const body = (() => { try { return JSON.parse(xhr.responseText) } catch { return null } })()
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body as MediaImportResult)
+      else reject(new Error(body?.detail || `视频上传失败 (${xhr.status})`))
+    }
+    const form = new FormData()
+    form.append('file', file, file.name)
+    xhr.send(form)
+  }),
 }

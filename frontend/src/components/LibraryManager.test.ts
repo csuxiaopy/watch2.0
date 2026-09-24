@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   createTag: vi.fn(), createCollection: vi.fn(),
   renameTag: vi.fn(), deleteTag: vi.fn(), renameCollection: vi.fn(), deleteCollection: vi.fn(),
   addToWatchlist: vi.fn(), createSource: vi.fn(), updateSource: vi.fn(), deleteSource: vi.fn(),
+  fileActions: vi.fn(), renameMediaFile: vi.fn(), deleteMediaFile: vi.fn(),
 }))
 vi.mock('../api', () => ({ api: mocks }))
 
@@ -21,6 +22,9 @@ describe('LibraryManager', () => {
   beforeEach(() => {
     mocks.libraryMedia.mockResolvedValue({ items: [sample], page: 1, page_size: 48, total: 1, pages: 1 })
     mocks.tags.mockResolvedValue([]); mocks.collections.mockResolvedValue([])
+    mocks.fileActions.mockResolvedValue({ local: true, can_rename: true, delete_mode: 'single_file', affected_media: 1, reason: null })
+    mocks.renameMediaFile.mockResolvedValue({ ...sample, name: 'renamed.mp4', original_name: 'renamed.mp4', location: '课程/renamed.mp4' })
+    mocks.deleteMediaFile.mockResolvedValue({ deleted_media_ids: [sample.id], deleted_files: [sample.location], torrent_hash: null })
   })
 
   it('loads media and sends a selected video to the wall', async () => {
@@ -50,5 +54,32 @@ describe('LibraryManager', () => {
     expect(wrapper.find('.download-panel').exists()).toBe(true)
     expect(wrapper.text()).toContain('磁力下载')
     expect(wrapper.find('.manager-sidebar').exists()).toBe(true)
+  })
+
+  it('shows media import below downloads inside the content area', async () => {
+    const wrapper = mount(LibraryManager, { props: { watchlistIds: [] } })
+    await flushPromises()
+    await wrapper.get('.import-nav').trigger('click')
+    expect(wrapper.find('.import-panel').exists()).toBe(true)
+    expect(wrapper.text()).toContain('打开文件选择器')
+    expect(wrapper.find('.manager-sidebar').exists()).toBe(true)
+  })
+
+  it('renames and permanently deletes a local video from details', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = mount(LibraryManager, { props: { watchlistIds: [] } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '详情')!.trigger('click')
+    await flushPromises()
+    await wrapper.get('input[maxlength="255"]').setValue('renamed.mp4')
+    await wrapper.findAll('button').find(button => button.text() === '修改真实文件名')!.trigger('click')
+    await flushPromises()
+    expect(mocks.renameMediaFile).toHaveBeenCalledWith(sample.id, 'renamed.mp4')
+    await wrapper.findAll('button').find(button => button.text() === '永久删除视频文件')!.trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledTimes(2)
+    expect(mocks.deleteMediaFile).toHaveBeenCalledWith(sample.id)
+    expect(wrapper.emitted('layoutChanged')).toHaveLength(1)
+    confirm.mockRestore()
   })
 })

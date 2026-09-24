@@ -7,7 +7,7 @@ services:
     ports:
       - "127.0.0.1:${APP_PORT:-8080}:8080"
     volumes:
-      - "${MEDIA_DIR:-./media}:/media/default:ro"
+      - "${MEDIA_DIR:-./media}:/media/default"
       - "${DOWNLOAD_DIR:-./data/downloads}/complete:/media/downloads:ro"
       - "${DATA_DIR:-./data}:/data"
       - "${QBT_SECRET_DIR:-./data/secrets}:/run/secrets:ro"
