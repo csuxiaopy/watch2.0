@@ -1,0 +1,4 @@
+services:
+  qbittorrent:
+    ports:
+      - "127.0.0.1:${QBT_WEBUI_ADMIN_PORT:-8081}:8080/tcp"

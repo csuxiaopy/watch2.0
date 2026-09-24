@@ -1,0 +1,57 @@
+services:
+  watch:
+    build:
+      context: .
+      args:
+        APT_MIRROR: ${APT_MIRROR:-repo.huaweicloud.com}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    volumes:
+      - "${MEDIA_DIR:-./media}:/media/default:ro"
+      - "${DOWNLOAD_DIR:-./data/downloads}/complete:/media/downloads:ro"
+      - "${DATA_DIR:-./data}:/data"
+      - "${QBT_SECRET_DIR:-./data/secrets}:/run/secrets:ro"
+    environment:
+      MEDIA_ROOT: /media/default
+      MEDIA_LIBRARIES: ${MEDIA_LIBRARIES:-}
+      DATABASE_PATH: /data/app.db
+      THUMBNAIL_ROOT: /data/thumbnails
+      DOWNLOAD_MEDIA_ROOT: /media/downloads
+      QBT_URL: http://qbittorrent:8080
+      QBT_API_KEY: ${QBT_API_KEY:-}
+      QBT_API_KEY_FILE: ${QBT_API_KEY_FILE:-/run/secrets/qbittorrent-api-key}
+      QBT_USERNAME: ${QBT_USERNAME:-}
+      QBT_PASSWORD: ${QBT_PASSWORD:-}
+    depends_on:
+      qbittorrent:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  qbittorrent:
+    image: ${QBT_IMAGE:-dockerproxy.net/qbittorrentofficial/qbittorrent-nox:5.2.3-1}
+    environment:
+      QBT_LEGAL_NOTICE: confirm
+      QBT_WEBUI_PORT: 8080
+      QBT_TORRENTING_PORT: ${QBT_TORRENT_PORT:-6881}
+    expose:
+      - "8080"
+    ports:
+      - "${QBT_TORRENT_PORT:-6881}:6881/tcp"
+      - "${QBT_TORRENT_PORT:-6881}:6881/udp"
+    volumes:
+      - "${QBT_CONFIG_DIR:-./data/qbittorrent}:/config"
+      - "${DOWNLOAD_DIR:-./data/downloads}:/downloads"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    tty: true
+    stop_grace_period: 30m
+    security_opt:
+      - no-new-privileges:true
